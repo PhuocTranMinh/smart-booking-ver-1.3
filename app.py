@@ -21,12 +21,28 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:
+    mqtt = None
+
+try:
+    from google.cloud import firestore
+    from google.oauth2 import service_account
+except ImportError:
+    firestore = None
+    service_account = None
+
 BASE = Path(__file__).parent
 DB_PATH = Path(os.getenv("ROOM_DB", str(BASE / "rooms.db")))
 SECRET = os.getenv("QR_SECRET", "demo-only-change-this-secret").encode()
 LOCK = threading.RLock()
 CHAT: dict[str, dict[str, Any]] = {}
 SESSIONS: dict[str, dict[str, str]] = {}
+MQTT_CLIENT = None
+MQTT_CONNECTED = False
+FIRESTORE = None
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "smart-booking-82438")
 app = FastAPI(title="Smart Study Room API", version="0.2.0")
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 
@@ -59,7 +75,8 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY, name TEXT NOT NULL, capacity INTEGER NOT NULL,
           amenities TEXT NOT NULL, hourly_rate INTEGER NOT NULL,
           online INTEGER NOT NULL DEFAULT 1, occupied INTEGER NOT NULL DEFAULT 0,
-          light_on INTEGER NOT NULL DEFAULT 0, fan_on INTEGER NOT NULL DEFAULT 0
+          light_on INTEGER NOT NULL DEFAULT 0, fan_on INTEGER NOT NULL DEFAULT 0,
+          speaker_on INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS bookings (
           id TEXT PRIMARY KEY, room_id INTEGER NOT NULL REFERENCES rooms(id),
@@ -76,6 +93,9 @@ def init_db() -> None:
           action TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL
         );
         """)
+        columns = {row[1] for row in c.execute("PRAGMA table_info(rooms)").fetchall()}
+        if "speaker_on" not in columns:
+            c.execute("ALTER TABLE rooms ADD COLUMN speaker_on INTEGER NOT NULL DEFAULT 0")
         if c.execute("SELECT COUNT(*) FROM rooms").fetchone()[0] == 0:
             c.executemany("INSERT INTO rooms(id,name,capacity,amenities,hourly_rate) VALUES(?,?,?,?,?)", [
                 (1, "Phòng học A101", 8, '["Máy chiếu","Bảng trắng","Điều hòa"]', 40000),
@@ -85,9 +105,281 @@ def init_db() -> None:
             ])
 
 
+def init_firestore() -> None:
+    global FIRESTORE
+    credentials_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if not credentials_json and not credentials_path:
+        return
+    if firestore is None:
+        raise RuntimeError("Thiếu google-cloud-firestore; hãy cài requirements.txt")
+    if credentials_json:
+        info = json.loads(credentials_json)
+        credentials = service_account.Credentials.from_service_account_info(info)
+        project_id = os.getenv("FIREBASE_PROJECT_ID", info.get("project_id", FIREBASE_PROJECT_ID))
+        FIRESTORE = firestore.Client(project=project_id, credentials=credentials)
+    else:
+        FIRESTORE = firestore.Client(project=FIREBASE_PROJECT_ID)
+    seed_firestore_rooms()
+
+
+def seed_firestore_rooms() -> None:
+    collection = FIRESTORE.collection("rooms")
+    if any(collection.limit(1).stream()):
+        return
+    defaults = [
+        (1, "Phòng học A101", 8, ["Máy chiếu", "Bảng trắng", "Điều hòa"], 40000),
+        (2, "Phòng thảo luận B204", 6, ["Màn hình", "Bảng trắng", "Điều hòa"], 35000),
+        (3, "Phòng lab C301", 20, ["Máy chiếu", "Máy tính", "Điều hòa"], 80000),
+        (4, "Phòng nhóm D102", 4, ["Màn hình", "Ổ cắm"], 25000),
+    ]
+    migrated_rooms = []
+    migrated_bookings = []
+    migrated_audit = []
+    migrated_events = []
+    if DB_PATH.exists():
+        try:
+            with db() as c:
+                migrated_rooms = [dict(row) for row in c.execute("SELECT * FROM rooms").fetchall()]
+                migrated_bookings = [dict(row) for row in c.execute("SELECT * FROM bookings").fetchall()]
+                migrated_audit = [dict(row) for row in c.execute("SELECT * FROM audit").fetchall()]
+                migrated_events = [dict(row) for row in c.execute("SELECT * FROM events").fetchall()]
+        except sqlite3.Error:
+            migrated_rooms = []
+    batch = FIRESTORE.batch()
+    for raw in migrated_rooms:
+        room = dict(raw)
+        room["amenities"] = json.loads(room["amenities"]) if isinstance(room.get("amenities"), str) else room.get("amenities", [])
+        room.setdefault("speaker_on", 0)
+        for key in ("online", "occupied", "light_on", "fan_on", "speaker_on"):
+            room[key] = bool(room.get(key, key == "online"))
+        batch.set(collection.document(str(room["id"])), room)
+    if not migrated_rooms:
+        for room_id, name, capacity, amenities, rate in defaults:
+            batch.set(collection.document(str(room_id)), {
+                "id": room_id, "name": name, "capacity": capacity, "amenities": amenities,
+                "hourly_rate": rate, "online": True, "occupied": False,
+                "light_on": False, "fan_on": False, "speaker_on": False,
+            })
+    batch.commit()
+    for collection_name, rows in (("bookings", migrated_bookings), ("audit", migrated_audit), ("events", migrated_events)):
+        chunk_size = 200 if collection_name == "bookings" else 400
+        for offset in range(0, len(rows), chunk_size):
+            migration_batch = FIRESTORE.batch()
+            for raw in rows[offset:offset + chunk_size]:
+                item = dict(raw)
+                item.pop("id", None)
+                migration_batch.set(FIRESTORE.collection(collection_name).document(str(raw.get("id") or uuid.uuid4().hex)), item)
+                if collection_name == "bookings" and raw.get("idempotency_key"):
+                    idem_id = hashlib.sha256(raw["idempotency_key"].encode()).hexdigest()
+                    migration_batch.set(FIRESTORE.collection("idempotency").document(idem_id), {"booking_id": str(raw["id"])})
+            migration_batch.commit()
+
+
+def fs_room(room_id: int) -> Optional[dict[str, Any]]:
+    snapshot = FIRESTORE.collection("rooms").document(str(room_id)).get()
+    if not snapshot.exists:
+        return None
+    room = snapshot.to_dict()
+    room.setdefault("id", room_id)
+    room.setdefault("amenities", [])
+    for key in ("online", "occupied", "light_on", "fan_on", "speaker_on"):
+        room.setdefault(key, False if key != "online" else True)
+    return room
+
+
+def fs_rooms() -> list[dict[str, Any]]:
+    rooms = [fs_room(int(doc.id)) for doc in FIRESTORE.collection("rooms").stream()]
+    return sorted((room for room in rooms if room), key=lambda room: room["id"])
+
+
+def fs_add_audit(actor: str, action: str, detail: str) -> None:
+    FIRESTORE.collection("audit").add({"actor": actor, "action": action, "detail": detail, "at": stamp(now())})
+
+
+def fs_add_event(booking_id: str, event: str, detail: str) -> None:
+    FIRESTORE.collection("events").add({"booking_id": booking_id, "event": event, "detail": detail, "at": stamp(now())})
+
+
+def fs_update_room(room_id: int, updates: dict[str, Any]) -> bool:
+    ref = FIRESTORE.collection("rooms").document(str(room_id))
+    if not ref.get().exists:
+        return False
+    ref.update(updates)
+    return True
+
+
+def fs_bookings() -> list[dict[str, Any]]:
+    return [{**doc.to_dict(), "id": doc.to_dict().get("id", doc.id)} for doc in FIRESTORE.collection("bookings").stream()]
+
+
+def fs_booking_conflict(room_id: int, start: str, end: str, exclude_id: Optional[str] = None) -> bool:
+    query = FIRESTORE.collection("bookings").where("room_id", "==", room_id)
+    for snapshot in query.stream():
+        booking = snapshot.to_dict()
+        booking.setdefault("id", snapshot.id)
+        if booking.get("id") == exclude_id or booking.get("room_id") != room_id:
+            continue
+        if booking.get("status") not in ("CONFIRMED", "CHECKED_IN"):
+            continue
+        if booking.get("start", "") < end and booking.get("end", "") > start:
+            return True
+    return False
+
+
+def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: datetime, end: datetime) -> dict[str, Any]:
+    booking_id = str(uuid.uuid4())
+    booking_ref = FIRESTORE.collection("bookings").document(booking_id)
+    room_ref = FIRESTORE.collection("rooms").document(str(data.room_id))
+    idem_ref = None
+    if data.idempotency_key:
+        idem_id = hashlib.sha256(data.idempotency_key.encode()).hexdigest()
+        idem_ref = FIRESTORE.collection("idempotency").document(idem_id)
+    expiration = end + timedelta(minutes=15)
+    booking = None
+
+    @firestore.transactional
+    def commit(transaction):
+        nonlocal booking
+        if idem_ref is not None:
+            existing_ref = transaction.get(idem_ref)
+            if existing_ref.exists:
+                existing_snapshot = transaction.get(FIRESTORE.collection("bookings").document(existing_ref.to_dict()["booking_id"]))
+                if existing_snapshot.exists:
+                    booking = {**existing_snapshot.to_dict(), "id": existing_snapshot.id}
+                    return booking
+        room_snapshot = transaction.get(room_ref)
+        if not room_snapshot.exists:
+            raise HTTPException(404, "Không tìm thấy phòng")
+        room = room_snapshot.to_dict()
+        if data.people > int(room.get("capacity", 0)):
+            raise HTTPException(400, "Số người vượt sức chứa phòng")
+        room_bookings = transaction.get(FIRESTORE.collection("bookings").where("room_id", "==", data.room_id))
+        for snapshot in room_bookings:
+            other = snapshot.to_dict()
+            if other.get("status") in ("CONFIRMED", "CHECKED_IN") and other.get("start", "") < stamp(end) and other.get("end", "") > stamp(start):
+                raise HTTPException(409, "Phòng vừa được đặt trong khoảng thời gian này")
+        cost = round(int(room.get("hourly_rate", 0)) * (end - start).total_seconds() / 3600)
+        booking = {
+            "id": booking_id, "room_id": data.room_id, "user_id": identity["user_id"],
+            "start": stamp(start), "end": stamp(end), "people": data.people,
+            "cost": cost, "status": "CONFIRMED", "qr_exp": stamp(expiration),
+            "idempotency_key": data.idempotency_key, "created": stamp(now()),
+        }
+        transaction.create(booking_ref, booking)
+        transaction.update(room_ref, {"booking_version": int(room.get("booking_version", 0)) + 1})
+        event_ref = FIRESTORE.collection("events").document()
+        transaction.set(event_ref, {"booking_id": booking_id, "event": "CONFIRMED", "at": stamp(now()), "detail": "Booking đã xác nhận"})
+        audit_ref = FIRESTORE.collection("audit").document()
+        transaction.set(audit_ref, {"actor": identity["user_id"], "action": "BOOKING_CREATED", "detail": booking_id, "at": stamp(now())})
+        if idem_ref is not None:
+            transaction.create(idem_ref, {"booking_id": booking_id})
+        return booking
+
+    try:
+        return booking_view(commit(FIRESTORE.transaction()))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, "Không ghi được booking lên Firestore; kiểm tra credential và cấu hình database") from exc
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    init_firestore()
+    start_mqtt()
+
+
+DEVICE_COLUMNS = {"lamp": "light_on", "fan": "fan_on", "speaker": "speaker_on"}
+
+
+def mqtt_on_connect(client, userdata, flags, reason_code, properties=None):
+    global MQTT_CONNECTED
+    MQTT_CONNECTED = int(reason_code) == 0
+    if MQTT_CONNECTED:
+        client.subscribe("rooms/+/telemetry", qos=1)
+        client.subscribe("rooms/+/status", qos=1)
+        client.subscribe("rooms/+/devices/+/status", qos=1)
+
+
+def apply_device_message(room_id: int, payload: dict[str, Any], actor: str = "mqtt-controller") -> None:
+    assignments = []
+    values = []
+    if "online" in payload:
+        assignments.append("online=?")
+        values.append(int(bool(payload["online"])))
+    if "occupied" in payload:
+        assignments.append("occupied=?")
+        values.append(int(bool(payload["occupied"])))
+    devices = payload.get("devices", {})
+    if not isinstance(devices, dict):
+        devices = {}
+    if "device" in payload and "on" in payload:
+        devices = dict(devices, **{payload["device"]: payload["on"]})
+    for device, state in devices.items():
+        column = DEVICE_COLUMNS.get(device)
+        if column and isinstance(state, bool):
+            assignments.append(column + "=?")
+            values.append(int(state))
+    if not assignments:
+        return
+    if FIRESTORE is not None:
+        field_updates = {}
+        for assignment, value in zip(assignments, values):
+            field_updates[assignment.split("=")[0]] = bool(value)
+        fs_update_room(room_id, field_updates)
+        fs_add_audit(actor, "MQTT_STATUS", "room=%s; %s" % (room_id, json.dumps(payload, ensure_ascii=False)))
+        return
+    with db() as c:
+        values.append(room_id)
+        c.execute("UPDATE rooms SET " + ",".join(assignments) + " WHERE id=?", values)
+        audit(c, actor, "MQTT_STATUS", "room=%s; %s" % (room_id, json.dumps(payload, ensure_ascii=False)))
+
+
+def mqtt_on_message(client, userdata, message):
+    try:
+        parts = message.topic.split("/")
+        room_id = int(parts[1])
+        payload = json.loads(message.payload.decode("utf-8"))
+        if len(parts) == 5 and parts[2] == "devices" and parts[4] == "status":
+            payload = dict(payload, device=parts[3])
+        apply_device_message(room_id, payload)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return
+    except Exception:
+        return
+
+
+def start_mqtt() -> None:
+    global MQTT_CLIENT
+    broker = os.getenv("MQTT_BROKER", "").strip()
+    if not broker or mqtt is None:
+        return
+    try:
+        port = int(os.getenv("MQTT_PORT", "8883" if os.getenv("MQTT_TLS", "true").lower() == "true" else "1883"))
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=os.getenv("MQTT_CLIENT_ID", "smart-room-backend"))
+        username = os.getenv("MQTT_USERNAME", "")
+        if username:
+            client.username_pw_set(username, os.getenv("MQTT_PASSWORD", ""))
+        if os.getenv("MQTT_TLS", "true").lower() == "true":
+            client.tls_set()
+        client.on_connect = mqtt_on_connect
+        client.on_message = mqtt_on_message
+        client.connect_async(broker, port, keepalive=30)
+        client.loop_start()
+        MQTT_CLIENT = client
+    except Exception:
+        MQTT_CLIENT = None
+
+
+def publish_room_command(room_id: int, devices: dict[str, bool]) -> dict[str, Any]:
+    payload = {"command_id": uuid.uuid4().hex, "devices": devices, "at": stamp(now())}
+    topic = "rooms/%s/command" % room_id
+    if MQTT_CLIENT is not None and MQTT_CONNECTED:
+        result = MQTT_CLIENT.publish(topic, json.dumps(payload), qos=1, retain=False)
+        return {"transport": "mqtt", "topic": topic, "published": result.rc == mqtt.MQTT_ERR_SUCCESS}
+    return {"transport": "http-simulation", "topic": topic, "published": False}
 
 
 def audit(c: sqlite3.Connection, actor: str, action: str, detail: str) -> None:
@@ -122,6 +414,11 @@ class TelemetryIn(BaseModel):
     room_id: int
     occupied: bool
     online: bool = True
+    devices: Optional[dict[str, bool]] = None
+
+
+class DeviceCommandIn(BaseModel):
+    devices: dict[str, bool]
 
 
 class LoginIn(BaseModel):
@@ -152,6 +449,18 @@ def parse_dt(raw: str) -> datetime:
 
 
 def free_rooms(start: datetime, end: datetime, people: int, amenities: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    if FIRESTORE is not None:
+        requested = {a.casefold() for a in (amenities or [])}
+        result = []
+        for room in fs_rooms():
+            if int(room.get("capacity", 0)) < people:
+                continue
+            current_amenities = room.get("amenities", [])
+            if requested and not requested.issubset({a.casefold() for a in current_amenities}):
+                continue
+            if not fs_booking_conflict(room["id"], stamp(start), stamp(end)):
+                result.append(room)
+        return sorted(result, key=lambda room: room.get("hourly_rate", 0))
     with db() as c:
         rows = c.execute("SELECT * FROM rooms WHERE capacity>=? ORDER BY hourly_rate", (people,)).fetchall()
         result = []
@@ -199,7 +508,7 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "database": "firestore" if FIRESTORE is not None else "sqlite"}
 
 
 @app.post("/api/auth/login")
@@ -219,8 +528,10 @@ def whoami(identity: dict[str, str] = Depends(current_user)):
 
 @app.get("/api/rooms")
 def rooms(identity: dict[str, str] = Depends(current_user)):
+    if FIRESTORE is not None:
+        return [{**r, "devices": {"lamp": bool(r["light_on"]), "fan": bool(r["fan_on"]), "speaker": bool(r["speaker_on"])}} for r in fs_rooms()]
     with db() as c:
-        return [{**dict(r), "amenities": json.loads(r["amenities"])} for r in c.execute("SELECT * FROM rooms ORDER BY id").fetchall()]
+        return [{**dict(r), "amenities": json.loads(r["amenities"]), "devices": {"lamp": bool(r["light_on"]), "fan": bool(r["fan_on"]), "speaker": bool(r["speaker_on"])}} for r in c.execute("SELECT * FROM rooms ORDER BY id").fetchall()]
 
 
 @app.get("/api/availability")
@@ -237,6 +548,8 @@ def create_booking(data: BookingIn, identity: dict[str, str] = Depends(current_u
     end = data.end.replace(tzinfo=timezone.utc) if data.end.tzinfo is None else data.end.astimezone(timezone.utc)
     if start >= end or start < now() - timedelta(minutes=1):
         raise HTTPException(400, "Khoảng thời gian không hợp lệ")
+    if FIRESTORE is not None:
+        return fs_create_booking(data, identity, start, end)
     with LOCK, db() as c:
         c.execute("BEGIN IMMEDIATE")
         try:
@@ -270,12 +583,29 @@ def create_booking(data: BookingIn, identity: dict[str, str] = Depends(current_u
 
 @app.get("/api/bookings")
 def list_bookings(identity: dict[str, str] = Depends(current_user)):
+    if FIRESTORE is not None:
+        items = [b for b in fs_bookings() if b.get("user_id") == identity["user_id"]]
+        return [booking_view(b) for b in sorted(items, key=lambda b: b.get("created", ""), reverse=True)]
     with db() as c:
         return [booking_view(r) for r in c.execute("SELECT * FROM bookings WHERE user_id=? ORDER BY created DESC", (identity["user_id"],)).fetchall()]
 
 
 @app.post("/api/bookings/{booking_id}/cancel")
 def cancel_booking(booking_id: str, identity: dict[str, str] = Depends(current_user)):
+    if FIRESTORE is not None:
+        ref = FIRESTORE.collection("bookings").document(booking_id)
+        snapshot = ref.get()
+        if not snapshot.exists:
+            raise HTTPException(404, "Không tìm thấy booking")
+        row = snapshot.to_dict()
+        if identity["role"] != "admin" and row.get("user_id") != identity["user_id"]:
+            raise HTTPException(403, "Không có quyền hủy booking này")
+        if row.get("status") != "CONFIRMED":
+            raise HTTPException(409, "Chỉ hủy được booking CONFIRMED")
+        ref.update({"status": "CANCELLED"})
+        fs_add_event(booking_id, "CANCELLED", "Người dùng hủy booking")
+        fs_add_audit(identity["user_id"], "BOOKING_CANCELLED", booking_id)
+        return {"ok": True, "status": "CANCELLED"}
     with db() as c:
         row = c.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
         if not row:
@@ -297,6 +627,42 @@ def validate_qr(data: QRIn, identity: dict[str, str] = Depends(current_user)):
         raise HTTPException(403, "QR không thuộc phòng này")
     if now() > parse_dt(payload.get("exp", "")):
         raise HTTPException(403, "QR đã hết hạn")
+    if FIRESTORE is not None:
+        booking_ref = FIRESTORE.collection("bookings").document(payload.get("booking_id", ""))
+        room_ref = FIRESTORE.collection("rooms").document(str(data.room_id))
+
+        @firestore.transactional
+        def checkin(transaction):
+            booking_snapshot = transaction.get(booking_ref)
+            if not booking_snapshot.exists:
+                raise HTTPException(404, "Không tìm thấy booking phù hợp")
+            row = booking_snapshot.to_dict()
+            if row.get("room_id") != data.room_id:
+                raise HTTPException(404, "Không tìm thấy booking phù hợp")
+            if identity["role"] != "admin" and row.get("user_id") != identity["user_id"]:
+                raise HTTPException(403, "QR không thuộc booking của tài khoản này")
+            if row.get("status") != "CONFIRMED":
+                raise HTTPException(409, "Booking không còn ở trạng thái CONFIRMED")
+            if now() < parse_dt(row["start"]) - timedelta(minutes=15):
+                raise HTTPException(403, "Check-in quá sớm")
+            if now() > parse_dt(row["end"]) + timedelta(minutes=15):
+                raise HTTPException(403, "Đã quá thời gian check-in")
+            room_snapshot = transaction.get(room_ref)
+            if not room_snapshot.exists:
+                raise HTTPException(404, "Không tìm thấy phòng")
+            transaction.update(booking_ref, {"status": "CHECKED_IN"})
+            transaction.update(room_ref, {"occupied": True})
+            event_ref = FIRESTORE.collection("events").document()
+            transaction.set(event_ref, {"booking_id": row["id"], "event": "CHECKED_IN", "at": stamp(now()), "detail": "QR hợp lệ; gửi lệnh bật đèn, quạt, loa"})
+            audit_ref = FIRESTORE.collection("audit").document()
+            transaction.set(audit_ref, {"actor": row["user_id"], "action": "CHECK_IN", "detail": row["id"], "at": stamp(now())})
+            return row
+
+        row = checkin(FIRESTORE.transaction())
+        transport = publish_room_command(data.room_id, {"lamp": True, "fan": True, "speaker": True})
+        if transport["transport"] != "mqtt" or not transport["published"]:
+            fs_update_room(data.room_id, {"light_on": True, "fan_on": True, "speaker_on": True})
+        return {"ok": True, "booking_id": row["id"], "status": "CHECKED_IN", "devices": {"lamp": True, "fan": True, "speaker": True}, **transport}
     with db() as c:
         row = c.execute("SELECT * FROM bookings WHERE id=?", (payload.get("booking_id"),)).fetchone()
         if not row or row["room_id"] != data.room_id:
@@ -314,11 +680,15 @@ def validate_qr(data: QRIn, identity: dict[str, str] = Depends(current_user)):
         if c.execute("SELECT changes()").fetchone()[0] == 0:
             c.execute("ROLLBACK")
             raise HTTPException(409, "Booking đã được xử lý")
-        c.execute("UPDATE rooms SET occupied=1,light_on=1,fan_on=1 WHERE id=?", (data.room_id,))
+        c.execute("UPDATE rooms SET occupied=1 WHERE id=?", (data.room_id,))
         c.execute("INSERT INTO events(booking_id,event,at,detail) VALUES(?,?,?,?)", (row["id"], "CHECKED_IN", stamp(now()), "QR hợp lệ; bật thiết bị mô phỏng"))
         audit(c, row["user_id"], "CHECK_IN", row["id"])
         c.execute("COMMIT")
-        return {"ok": True, "booking_id": row["id"], "status": "CHECKED_IN", "devices": {"light": "on", "fan": "on"}}
+    transport = publish_room_command(data.room_id, {"lamp": True, "fan": True, "speaker": True})
+    if transport["transport"] != "mqtt" or not transport["published"]:
+        with db() as c:
+            c.execute("UPDATE rooms SET light_on=1,fan_on=1,speaker_on=1 WHERE id=?", (data.room_id,))
+    return {"ok": True, "booking_id": row["id"], "status": "CHECKED_IN", "devices": {"lamp": True, "fan": True, "speaker": True}, **transport}
 
 
 @app.get("/api/qr/image")
@@ -333,15 +703,66 @@ def qr_image(token: str):
 
 @app.post("/api/iot/telemetry")
 def telemetry(data: TelemetryIn):
+    if FIRESTORE is not None:
+        room = fs_room(data.room_id)
+        if not room:
+            raise HTTPException(404, "Không tìm thấy phòng")
+        devices = data.devices or {"lamp": data.occupied, "fan": data.occupied, "speaker": data.occupied}
+        updates = {"online": data.online, "occupied": data.occupied}
+        for device, state in devices.items():
+            column = DEVICE_COLUMNS.get(device)
+            if not column:
+                raise HTTPException(400, "Thiết bị hợp lệ: lamp, fan, speaker")
+            updates[column] = state
+        fs_update_room(data.room_id, updates)
+        fs_add_audit("http-controller", "TELEMETRY", "room=%s; occupied=%s; online=%s; devices=%s" % (data.room_id, data.occupied, data.online, json.dumps(devices)))
+        if not data.occupied:
+            for booking in fs_bookings():
+                if booking.get("room_id") == data.room_id and booking.get("status") == "CHECKED_IN" and booking.get("end", "") <= stamp(now()):
+                    FIRESTORE.collection("bookings").document(booking["id"]).update({"status": "COMPLETED"})
+        return {"ok": True, "room_id": data.room_id, "online": data.online, "occupied": data.occupied, "devices": devices, "transport": "http-simulation"}
     with db() as c:
         room = c.execute("SELECT id FROM rooms WHERE id=?", (data.room_id,)).fetchone()
         if not room:
             raise HTTPException(404, "Không tìm thấy phòng")
-        c.execute("UPDATE rooms SET online=?,occupied=?,light_on=?,fan_on=? WHERE id=?", (int(data.online), int(data.occupied), int(data.occupied), int(data.occupied), data.room_id))
-        c.execute("INSERT INTO audit(actor,action,detail,at) VALUES(?,?,?,?)", ("room-controller", "TELEMETRY", f"room={data.room_id}; occupied={data.occupied}; online={data.online}", stamp(now())))
+        devices = data.devices or {"lamp": data.occupied, "fan": data.occupied, "speaker": data.occupied}
+        assignments = ["online=?", "occupied=?"]
+        values = [int(data.online), int(data.occupied)]
+        for device, state in devices.items():
+            column = DEVICE_COLUMNS.get(device)
+            if not column:
+                raise HTTPException(400, "Thiết bị hợp lệ: lamp, fan, speaker")
+            assignments.append(column + "=?")
+            values.append(int(state))
+        values.append(data.room_id)
+        c.execute("UPDATE rooms SET " + ",".join(assignments) + " WHERE id=?", values)
+        c.execute("INSERT INTO audit(actor,action,detail,at) VALUES(?,?,?,?)", ("http-controller", "TELEMETRY", f"room={data.room_id}; occupied={data.occupied}; online={data.online}; devices={json.dumps(devices)}", stamp(now())))
         if not data.occupied:
             c.execute("UPDATE bookings SET status='COMPLETED' WHERE room_id=? AND status='CHECKED_IN' AND end<=?", (data.room_id, stamp(now())))
-        return {"ok": True, "room_id": data.room_id, "online": data.online, "occupied": data.occupied}
+        return {"ok": True, "room_id": data.room_id, "online": data.online, "occupied": data.occupied, "devices": devices, "transport": "http-simulation"}
+
+
+@app.post("/api/admin/rooms/{room_id}/devices")
+def command_devices(room_id: int, data: DeviceCommandIn, identity: dict[str, str] = Depends(current_user)):
+    require_admin(identity["role"])
+    if not data.devices or set(data.devices) - set(DEVICE_COLUMNS):
+        raise HTTPException(400, "Thiết bị hợp lệ: lamp, fan, speaker")
+    transport = publish_room_command(room_id, data.devices)
+    if FIRESTORE is not None:
+        if not fs_room(room_id):
+            raise HTTPException(404, "Không tìm thấy phòng")
+        if transport["transport"] != "mqtt" or not transport["published"]:
+            fs_update_room(room_id, {DEVICE_COLUMNS[key]: value for key, value in data.devices.items()})
+        fs_add_audit(identity["user_id"], "DEVICE_COMMAND", "room=%s; %s" % (room_id, json.dumps(data.devices)))
+        return {"ok": True, "room_id": room_id, "devices": data.devices, **transport}
+    with db() as c:
+        if not c.execute("SELECT id FROM rooms WHERE id=?", (room_id,)).fetchone():
+            raise HTTPException(404, "Không tìm thấy phòng")
+        if transport["transport"] != "mqtt" or not transport["published"]:
+            assignments = [DEVICE_COLUMNS[key] + "=?" for key in data.devices]
+            c.execute("UPDATE rooms SET " + ",".join(assignments) + " WHERE id=?", (*[int(v) for v in data.devices.values()], room_id))
+        audit(c, identity["user_id"], "DEVICE_COMMAND", "room=%s; %s" % (room_id, json.dumps(data.devices)))
+    return {"ok": True, "room_id": room_id, "devices": data.devices, **transport}
 
 
 @app.post("/api/chat")
@@ -350,9 +771,39 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
     state = CHAT.setdefault(identity["user_id"] + ":" + data.session_id, {})
     normalized = message.casefold()
 
-    # Informational room questions use the database as the source of truth.
-    if re.search(r"(các loại|loại.*phòng|phòng.*loại nào|có.*phòng.*(?:gì|nào)|giới thiệu.*phòng|thông tin.*phòng|danh sách phòng|(?:giá|sức chứa|tiện nghi).*phòng|phòng.*(?:tiện nghi|sức chứa|giá))", normalized):
+    if re.search(r"(dịch vụ|bạn.*giúp.*gì|bạn làm được gì|có thể giúp|có những chức năng gì|cách đặt|check.?in.*qr)", normalized):
         state.pop("pending_confirm", None)
+        return {"reply": "Mình có thể giúp bạn:\n• Giới thiệu phòng, tiện nghi và giá hiện tại.\n• Tìm phòng còn trống theo số người, ngày, giờ và thời lượng.\n• Tạo booking và cấp QR check-in.\n• Điều khiển thiết bị phòng gồm đèn, quạt và loa. Hệ thống nhận telemetry/cập nhật trạng thái qua MQTT; nếu chưa cấu hình broker thì demo mô phỏng qua HTTP.\n\nBạn muốn xem dịch vụ thiết bị, loại phòng, bảng giá hay bắt đầu tìm phòng?"}
+
+    if re.search(r"(bảng giá|chi phí|mức phí|bao nhiêu (?:tiền|đồng|một giờ)|giá\s*(?:phòng|bao nhiêu|thế nào|ra sao)|phòng\s+[a-d]\d{3}\s+giá)", normalized):
+        if FIRESTORE is not None:
+            rows = sorted(fs_rooms(), key=lambda room: room.get("hourly_rate", 0))
+            room_code = re.search(r"\b([a-d]\d{3})\b", normalized)
+            if room_code:
+                rows = [room for room in rows if room_code.group(1).upper() in room.get("name", "").upper()]
+            state.pop("pending_confirm", None)
+            if not rows:
+                return {"reply": "Mình không tìm thấy phòng đó. Bạn có thể nhắn ‘bảng giá’ để xem giá các phòng hiện có."}
+            lines = [f"• {r['name']}: {r['hourly_rate']:,}₫/giờ · tối đa {r['capacity']} người" for r in rows]
+            return {"reply": "Giá phòng hiện tại (theo cấu hình hệ thống):\n" + "\n".join(lines) + "\nBạn muốn mình tìm phòng còn trống vào ngày, giờ và thời lượng nào?"}
+        with db() as c:
+            rows = c.execute("SELECT name,capacity,amenities,hourly_rate FROM rooms ORDER BY hourly_rate").fetchall()
+        room_code = re.search(r"\b([a-d]\d{3})\b", normalized)
+        if room_code:
+            rows = [r for r in rows if room_code.group(1).upper() in r["name"].upper()]
+        state.pop("pending_confirm", None)
+        if not rows:
+            return {"reply": "Mình không tìm thấy phòng đó. Bạn có thể nhắn ‘bảng giá’ để xem giá các phòng hiện có."}
+        lines = [f"• {r['name']}: {r['hourly_rate']:,}₫/giờ · tối đa {r['capacity']} người" for r in rows]
+        return {"reply": "Giá phòng hiện tại (theo cấu hình hệ thống):\n" + "\n".join(lines) + "\nBạn muốn mình tìm phòng còn trống vào ngày, giờ và thời lượng nào?"}
+
+    # Informational room questions use the database as the source of truth.
+    if re.search(r"(các loại|loại.*phòng|phòng.*loại nào|có.*phòng.*(?:gì|nào)|giới thiệu.*phòng|thông tin.*phòng|danh sách phòng|phòng.*(?:tiện nghi|sức chứa))", normalized):
+        state.pop("pending_confirm", None)
+        if FIRESTORE is not None:
+            rows = sorted(fs_rooms(), key=lambda room: room.get("capacity", 0))
+            descriptions = [f"• {r['name']}: tối đa {r['capacity']} người; tiện nghi {', '.join(r.get('amenities', []))}; {r['hourly_rate']:,}₫/giờ" for r in rows]
+            return {"reply": "Hiện có các phòng sau (thông tin lấy từ hệ thống):\n" + "\n".join(descriptions) + "\nBạn muốn đặt phòng nào? Hãy cho mình biết số người, ngày, giờ bắt đầu và thời lượng."}
         with db() as c:
             rows = c.execute("SELECT name,capacity,amenities,hourly_rate FROM rooms ORDER BY capacity").fetchall()
         descriptions = [f"• {r['name']}: tối đa {r['capacity']} người; tiện nghi {', '.join(json.loads(r['amenities']))}; {r['hourly_rate']:,}₫/giờ" for r in rows]
@@ -454,6 +905,9 @@ def chat(data: ChatIn, identity: dict[str, str] = Depends(current_user)):
 @app.get("/api/admin/audit")
 def get_audit(identity: dict[str, str] = Depends(current_user)):
     require_admin(identity["role"])
+    if FIRESTORE is not None:
+        items = [doc.to_dict() for doc in FIRESTORE.collection("audit").stream()]
+        return sorted(items, key=lambda item: item.get("at", ""), reverse=True)[:200]
     with db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 200").fetchall()]
 
@@ -468,6 +922,11 @@ def update_room(room_id: int, values: dict[str, Any], identity: dict[str, str] =
         raise HTTPException(400, "amenities phải là danh sách")
     if ("capacity" in values and int(values["capacity"]) < 1) or ("hourly_rate" in values and int(values["hourly_rate"]) < 0):
         raise HTTPException(400, "Sức chứa hoặc giá không hợp lệ")
+    if FIRESTORE is not None:
+        if not fs_update_room(room_id, values):
+            raise HTTPException(404, "Không tìm thấy phòng")
+        fs_add_audit("admin", "ROOM_UPDATED", "room=" + str(room_id))
+        return {"ok": True, "room_id": room_id}
     update = {k: json.dumps(v, ensure_ascii=False) if k == "amenities" else v for k, v in values.items()}
     clause = ",".join(k + "=?" for k in update)
     with db() as c:
@@ -481,5 +940,9 @@ def update_room(room_id: int, values: dict[str, Any], identity: dict[str, str] =
 @app.get("/api/admin/bookings")
 def admin_bookings(identity: dict[str, str] = Depends(current_user)):
     require_admin(identity["role"])
+    if FIRESTORE is not None:
+        rooms_by_id = {r["id"]: r["name"] for r in fs_rooms()}
+        items = [dict(b, room_name=rooms_by_id.get(b.get("room_id"), "Phòng")) for b in fs_bookings()]
+        return sorted(items, key=lambda booking: booking.get("created", ""), reverse=True)
     with db() as c:
         return [dict(r) for r in c.execute("SELECT b.*,r.name room_name FROM bookings b JOIN rooms r ON r.id=b.room_id ORDER BY b.created DESC").fetchall()]
