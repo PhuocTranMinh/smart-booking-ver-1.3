@@ -242,11 +242,22 @@ def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: dateti
     def commit(transaction):
         nonlocal booking
         if idem_ref is not None:
-            existing_ref = transaction.get(idem_ref)
-            if existing_ref.exists:
-                existing_snapshot = transaction.get(FIRESTORE.collection("bookings").document(existing_ref.to_dict()["booking_id"]))
-                if existing_snapshot.exists:
-                    booking = {**existing_snapshot.to_dict(), "id": existing_snapshot.id}
+            existing_docs = list(transaction.get(idem_ref))
+
+            if existing_docs:
+                existing_ref = existing_docs[0]
+
+                existing_snapshot = list(
+                    transaction.get(
+                        FIRESTORE.collection("bookings").document(
+                            existing_ref.to_dict()["booking_id"]
+                        )
+                    )
+                )
+
+                if existing_snapshot:
+                    snapshot = existing_snapshot[0]
+                    booking = {**snapshot.to_dict(), "id": snapshot.id}
                     return booking
         room_snapshot = transaction.get(room_ref)
         if not room_snapshot.exists:
