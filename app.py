@@ -281,8 +281,18 @@ def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: dateti
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(503, "Không ghi được booking lên Firestore; kiểm tra credential và cấu hình database") from exc
+        import traceback
 
+        print("========== FIRESTORE BOOKING ERROR ==========")
+        print("ERROR TYPE:", type(exc).__name__)
+        print("ERROR:", repr(exc))
+        traceback.print_exc()
+        print("==============================================", flush=True)
+
+        raise HTTPException(
+            503,
+            f"Firestore error: {type(exc).__name__}: {str(exc)}"
+        ) from exc
 
 @app.on_event("startup")
 def startup() -> None:
@@ -492,16 +502,8 @@ def decode_token(token: str) -> dict[str, Any]:
             raise ValueError("signature")
         return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
     except Exception as exc:
-        import traceback
-        print("========== FIRESTORE BOOKING ERROR ==========")
-        print(type(exc).__name__, str(exc))
-        traceback.print_exc()
-        print("=============================================")
+        raise HTTPException(400, "QR không hợp lệ hoặc đã bị thay đổi") from exc
 
-        raise HTTPException(
-            503,
-            f"Firestore error: {type(exc).__name__}: {str(exc)}"
-        ) from exc
 
 def booking_view(row: Union[sqlite3.Row, dict]) -> dict[str, Any]:
     booking = dict(row)
