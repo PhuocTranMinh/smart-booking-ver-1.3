@@ -252,21 +252,18 @@ def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: dateti
     def commit(transaction):
         nonlocal booking
         if idem_ref is not None:
-            existing_docs = list(transaction.get(idem_ref))
-
-            if existing_docs:
-                existing_ref = existing_docs[0]
-
-                existing_snapshot = fs_transaction_get_one(
-                    transaction,
-                    FIRESTORE.collection("bookings").document(
-                        existing_ref.to_dict()["booking_id"]
-                    ),
-                )
-
-                if existing_snapshot is not None and existing_snapshot.exists:
-                    booking = {**existing_snapshot.to_dict(), "id": existing_snapshot.id}
-                    return booking
+            existing_idempotency = fs_transaction_get_one(transaction, idem_ref)
+            if existing_idempotency is not None and existing_idempotency.exists:
+                existing_data = existing_idempotency.to_dict() or {}
+                existing_booking_id = existing_data.get("booking_id")
+                if existing_booking_id:
+                    existing_booking = fs_transaction_get_one(
+                        transaction,
+                        FIRESTORE.collection("bookings").document(existing_booking_id),
+                    )
+                    if existing_booking is not None and existing_booking.exists:
+                        booking = {**existing_booking.to_dict(), "id": existing_booking.id}
+                        return booking
         room_snapshot = fs_transaction_get_one(transaction, room_ref)
         if room_snapshot is None or not room_snapshot.exists:
             raise HTTPException(404, "Không tìm thấy phòng")
@@ -292,7 +289,7 @@ def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: dateti
         audit_ref = FIRESTORE.collection("audit").document()
         transaction.set(audit_ref, {"actor": identity["user_id"], "action": "BOOKING_CREATED", "detail": booking_id, "at": stamp(now())})
         if idem_ref is not None:
-            transaction.create(idem_ref, {"booking_id": booking_id})
+            transaction.set(idem_ref, {"booking_id": booking_id})
         return booking
 
     try:
