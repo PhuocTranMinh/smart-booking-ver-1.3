@@ -210,7 +210,17 @@ def fs_update_room(room_id: int, updates: dict[str, Any]) -> bool:
 
 
 def fs_bookings() -> list[dict[str, Any]]:
-    return [{**doc.to_dict(), "id": doc.to_dict().get("id", doc.id)} for doc in FIRESTORE.collection("bookings").stream()]
+    result = []
+    for doc in FIRESTORE.collection("bookings").stream():
+        item = doc.to_dict()
+        item.setdefault("id", doc.id)
+        result.append(item)
+    return result
+
+
+def fs_transaction_get_one(transaction, reference):
+    """Transaction.get yields snapshots in the Python Firestore client."""
+    return next(iter(transaction.get(reference)), None)
 
 
 def fs_booking_conflict(room_id: int, start: str, end: str, exclude_id: Optional[str] = None) -> bool:
@@ -247,20 +257,18 @@ def fs_create_booking(data: "BookingIn", identity: dict[str, str], start: dateti
             if existing_docs:
                 existing_ref = existing_docs[0]
 
-                existing_snapshot = list(
-                    transaction.get(
-                        FIRESTORE.collection("bookings").document(
-                            existing_ref.to_dict()["booking_id"]
-                        )
-                    )
+                existing_snapshot = fs_transaction_get_one(
+                    transaction,
+                    FIRESTORE.collection("bookings").document(
+                        existing_ref.to_dict()["booking_id"]
+                    ),
                 )
 
-                if existing_snapshot:
-                    snapshot = existing_snapshot[0]
-                    booking = {**snapshot.to_dict(), "id": snapshot.id}
+                if existing_snapshot is not None and existing_snapshot.exists:
+                    booking = {**existing_snapshot.to_dict(), "id": existing_snapshot.id}
                     return booking
-        room_snapshot = transaction.get(room_ref)
-        if not room_snapshot.exists:
+        room_snapshot = fs_transaction_get_one(transaction, room_ref)
+        if room_snapshot is None or not room_snapshot.exists:
             raise HTTPException(404, "Không tìm thấy phòng")
         room = room_snapshot.to_dict()
         if data.people > int(room.get("capacity", 0)):
@@ -529,7 +537,14 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "database": "firestore" if FIRESTORE is not None else "sqlite"}
+    if FIRESTORE is None:
+        return {"status": "ok", "database": "sqlite", "firestore_connected": False}
+    try:
+        next(iter(FIRESTORE.collection("rooms").limit(1).stream()), None)
+        return {"status": "ok", "database": "firestore", "firestore_connected": True}
+    except Exception as exc:
+        print("Firestore health check failed: %s: %s" % (type(exc).__name__, str(exc)), flush=True)
+        return {"status": "degraded", "database": "firestore", "firestore_connected": False, "error": type(exc).__name__}
 
 
 @app.post("/api/auth/login")
@@ -654,8 +669,8 @@ def validate_qr(data: QRIn, identity: dict[str, str] = Depends(current_user)):
 
         @firestore.transactional
         def checkin(transaction):
-            booking_snapshot = transaction.get(booking_ref)
-            if not booking_snapshot.exists:
+            booking_snapshot = fs_transaction_get_one(transaction, booking_ref)
+            if booking_snapshot is None or not booking_snapshot.exists:
                 raise HTTPException(404, "Không tìm thấy booking phù hợp")
             row = booking_snapshot.to_dict()
             if row.get("room_id") != data.room_id:
@@ -668,8 +683,8 @@ def validate_qr(data: QRIn, identity: dict[str, str] = Depends(current_user)):
                 raise HTTPException(403, "Check-in quá sớm")
             if now() > parse_dt(row["end"]) + timedelta(minutes=15):
                 raise HTTPException(403, "Đã quá thời gian check-in")
-            room_snapshot = transaction.get(room_ref)
-            if not room_snapshot.exists:
+            room_snapshot = fs_transaction_get_one(transaction, room_ref)
+            if room_snapshot is None or not room_snapshot.exists:
                 raise HTTPException(404, "Không tìm thấy phòng")
             transaction.update(booking_ref, {"status": "CHECKED_IN"})
             transaction.update(room_ref, {"occupied": True})

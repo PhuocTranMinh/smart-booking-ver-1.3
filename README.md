@@ -50,7 +50,7 @@ Ngày giờ API dùng ISO 8601. Khi chưa đặt credential Firebase, app dùng 
 
 Trong Google Cloud Console của project, tạo service account riêng cho app và cấp quyền dữ liệu tối thiểu **Cloud Datastore User** (`roles/datastore.user`). Tạo khóa JSON cho service account; khóa này chỉ đặt ở môi trường server, không commit lên GitHub và không gửi qua chat. Firebase Admin/server credentials truy cập Firestore bằng IAM; Firestore Security Rules không thay thế quyền IAM của server. [Hướng dẫn Firebase Admin SDK](https://firebase.google.com/docs/admin/setup) · [Quyền IAM Firestore](https://docs.cloud.google.com/firestore/docs/security/iam)
 
-Trên Render, Blueprint khai báo `FIREBASE_PROJECT_ID=smart-booking-82438` và hỏi giá trị secret `FIREBASE_SERVICE_ACCOUNT_JSON`. Dán nội dung JSON service-account vào ô secret trong Render, lưu rồi redeploy. Local PowerShell có thể đặt biến cho phiên hiện tại trước khi chạy app:
+Trên Render, cách khuyến nghị là tải JSON lên mục **Environment → Secret Files** với tên `firebase-service-account.json`, sau đó đặt `GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/firebase-service-account.json`. Đặt thêm `FIREBASE_PROJECT_ID=smart-booking-82438` và redeploy. Có thể thay Secret File bằng secret environment variable `FIREBASE_SERVICE_ACCOUNT_JSON` chứa toàn bộ JSON. Local PowerShell có thể đặt biến cho phiên hiện tại trước khi chạy app:
 
 ```powershell
 $env:FIREBASE_PROJECT_ID = "smart-booking-82438"
@@ -58,7 +58,7 @@ $env:FIREBASE_SERVICE_ACCOUNT_JSON = Get-Content -Raw .\firebase-service-account
 .venv\Scripts\python.exe -m uvicorn app:app --reload
 ```
 
-Không đưa file service-account vào ZIP/repository. Nếu credential chưa cấu hình, ứng dụng tự dùng SQLite local; khi dùng Firestore, bản ghi phòng/booking không còn phụ thuộc filesystem tạm của Render.
+Không đưa file service-account vào ZIP/repository. `/api/health` trả `firestore_connected: true` sau khi xác nhận đọc được Firestore. Nếu credential chưa cấu hình, ứng dụng tự dùng SQLite local; khi dùng Firestore, bản ghi phòng/booking không còn phụ thuộc filesystem tạm của Render.
 
 ## MQTT cho thiết bị
 
